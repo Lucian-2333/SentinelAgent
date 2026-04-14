@@ -25,6 +25,7 @@ Thumbs.db
 # Local runtime artifacts
 *.log
 *.tmp
+sentinel_audit.db
 
 # Project-specific local backups and generated outputs
 frontend_backup_*/

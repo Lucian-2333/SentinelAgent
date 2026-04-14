@@ -41,10 +41,28 @@ async def audit_packet(packet: Packet) -> ConsensusVerdict:
             verdict.status,
             verdict.aggregate_confidence,
         )
-        return verdict
     except Exception as exc:
         logger.exception("Pipeline failure for packet %s", packet.packet_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Audit pipeline error: {exc}",
         ) from exc
+
+    # ── Persist audit record ──────────────────────────────────────────────────
+    from shared.database import log_request  # deferred to avoid circular
+
+    try:
+        await log_request({
+            "source_ip":    packet.metadata.ip_address,
+            "payload":      packet.raw_text,
+            "risk_score":   verdict.aggregate_confidence,
+            "reasoning":    verdict.judge_reasoning,
+            "final_action": verdict.status,
+        })
+    except Exception:
+        logger.exception(
+            "Audit log write failed for packet %s — verdict still returned",
+            packet.packet_id,
+        )
+
+    return verdict

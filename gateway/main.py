@@ -36,7 +36,10 @@ logger = logging.getLogger("sentinel.gateway")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from shared.database import init_db  # deferred to keep imports tidy
+
     logger.info("🛡️  SentinelAgent Gateway starting up…")
+    await init_db()  # ensure audit_logs table exists before first request
     yield
     logger.info("🛡️  SentinelAgent Gateway shutting down.")
 
@@ -129,4 +132,19 @@ async def intercept(request: Request):
     logger.info("Intercepted packet %s from %s", packet.packet_id, meta.source)
 
     verdict = await run_consensus_pipeline(packet)
+
+    # ── Persist audit record (fire-and-forget; never blocks the response) ──
+    from shared.database import log_request  # deferred — same pattern as above
+
+    try:
+        await log_request({
+            "source_ip":    meta.ip_address,
+            "payload":      packet.raw_text,
+            "risk_score":   verdict.aggregate_confidence,
+            "reasoning":    verdict.judge_reasoning,
+            "final_action": verdict.status,
+        })
+    except Exception:
+        logger.exception("Audit log write failed for packet %s — verdict still returned", packet.packet_id)
+
     return verdict.model_dump(mode="json")

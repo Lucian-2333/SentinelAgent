@@ -13,6 +13,10 @@ pydantic = "^2.7.0"
 openai = "^1.30.0"           # DeepSeek / OpenAI / 任意兼容端点
 anthropic = "^0.28.0"        # Anthropic Claude 原生 SDK（可选）
 python-dotenv = "^1.0.0"     # 自动加载 .env 文件
+aiosqlite = "^0.20.0"        # 异步 SQLite 驱动（审计日志持久化）
+pandas = "^2.0.0"            # 数据格式化（Admin Dashboard）
+plotly = "^5.18.0"           # 交互式图表（攻击类型分布）
+streamlit = "^1.35.0"        # 前端框架
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.2.0"

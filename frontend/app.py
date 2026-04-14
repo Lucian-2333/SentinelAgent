@@ -390,6 +390,21 @@ with col2:
         verdict = build_verdict([pattern_result, context_result], packet.packet_id)
         time.sleep(0.3)
         anim_verdict.markdown(_verdict_html(verdict), unsafe_allow_html=True)
+
+        # ── Step D：写入审计日志数据库 ───────────────────────────────
+        try:
+            from shared.database import init_db, log_request
+            asyncio.run(init_db())
+            asyncio.run(log_request({
+                "source_ip":    packet.metadata.ip_address or "127.0.0.1",
+                "payload":      packet.raw_text,
+                "risk_score":   verdict.aggregate_confidence,
+                "reasoning":    verdict.judge_reasoning,
+                "final_action": verdict.status,
+            }))
+        except Exception:
+            pass  # DB 写入失败不影响 UI 展示
+
         time.sleep(1.0)
 
         # ── 写入历史并 rerun ──────────────────────────────────────────

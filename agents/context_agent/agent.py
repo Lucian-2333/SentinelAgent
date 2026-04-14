@@ -186,17 +186,29 @@ class ContextAgent(BaseAgent):
 
     def _safe_pass(self, packet: Packet, reason: str) -> AuditResult:
         """
-        Return a zero-confidence UNKNOWN verdict so the judge pipeline
+        Return a zero-confidence BENIGN verdict so the judge pipeline
         can still produce a result using the PatternAgent alone.
-        The warning flag in reasoning makes the failure fully auditable.
+
+        Why BENIGN (not UNKNOWN)?
+        The Pydantic AuditResult validator enforces that every non-BENIGN
+        verdict must carry at least one evidence substring.  UNKNOWN is a
+        *threat category*, so supplying it with evidence=[] would violate
+        the schema contract and crash the pipeline.  A BENIGN verdict with
+        confidence=0.0 is semantically correct here: the agent is explicitly
+        saying "I found nothing" (because it couldn't run), and a confidence
+        of 0.0 means the judge treats this result as neutral — it carries no
+        weight in the consensus.  The warning flag in `reasoning` makes the
+        failure fully auditable.
         """
-        logger.warning("[%s] Safe-Pass issued for packet=%s — %s",
-                       self.agent_id, packet.packet_id, reason)
+        logger.warning(
+            "[%s] Safe-Pass issued for packet=%s — %s",
+            self.agent_id, packet.packet_id, reason,
+        )
         return AuditResult(
             agent_id=self.agent_id,
             packet_id=packet.packet_id,
-            threat_category=ThreatCategory.UNKNOWN,
-            confidence=0.0,
+            threat_category=ThreatCategory.BENIGN,   # BENIGN allows evidence=[]
+            confidence=0.0,                           # 0.0 = no weight in consensus
             reasoning=(
                 f"⚠️ [SAFE-PASS] ContextAgent could not complete semantic analysis. "
                 f"Reason: {reason}. "
