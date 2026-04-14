@@ -31,3 +31,6 @@ frontend_backup_*/
 
 # Local environment files
 .env
+
+# Local agent config
+.claude/
