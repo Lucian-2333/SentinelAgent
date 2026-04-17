@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import secrets
 import sys
 from pathlib import Path
 
@@ -42,9 +43,14 @@ import pandas as pd
 import streamlit as st
 
 # ── Path bootstrap ──────────────────────────────────────────────────────────
-# Works whether launched as `streamlit run pages/Admin_Dashboard.py`
-# or via the automatic pages/ discovery from the project root.
-ROOT = Path(__file__).parent.parent
+# /app is in PYTHONPATH (set in Dockerfile) so `import shared` always works.
+# ROOT is still needed for loading .env and styles.css.
+_here = Path(__file__).resolve()
+ROOT = _here.parent
+while ROOT != ROOT.parent:
+    if (ROOT / "shared").is_dir():
+        break
+    ROOT = ROOT.parent
 sys.path.insert(0, str(ROOT))
 
 # Load .env (python-dotenv) — safe even if already loaded elsewhere
@@ -55,6 +61,23 @@ except ImportError:
     pass
 
 from shared.database import get_recent_logs  # noqa: E402
+
+
+# ── Async helper ─────────────────────────────────────────────────────────────
+# asyncio.run() raises RuntimeError when an event loop is already running
+# (Streamlit ≥1.18 uses one internally).  Use a thread-safe wrapper instead.
+def _run(coro):
+    """Run an async coroutine from synchronous Streamlit code, safely."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    return asyncio.run(coro)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -246,7 +269,17 @@ _ATTACK_PATTERNS: dict[str, re.Pattern[str]] = {
 }
 
 _ADMIN_USER: str = os.getenv("ADMIN_USERNAME", "admin")
-_ADMIN_PASS: str = os.getenv("ADMIN_PASSWORD", "sentinel2024")
+_ADMIN_PASS: str = os.getenv("ADMIN_PASSWORD", "")
+
+# Refuse to start if ADMIN_PASSWORD was never set — fail loudly rather than
+# silently allowing access with a blank or default credential.
+if not _ADMIN_PASS:
+    st.error(
+        "⛔ ADMIN_PASSWORD is not set in the environment. "
+        "Set it in your .env file and restart the service.",
+        icon="🔒",
+    )
+    st.stop()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -274,10 +307,17 @@ def _render_login() -> None:
         user = st.text_input("Username", placeholder="admin", key="_adm_u")
         pwd  = st.text_input("Password", type="password", placeholder="••••••••", key="_adm_p")
         if st.button("Sign In →", use_container_width=True):
-            if user == _ADMIN_USER and pwd == _ADMIN_PASS:
+            # secrets.compare_digest prevents timing side-channel attacks.
+            # The artificial 0.5 s delay on failure throttles brute-force scripts
+            # without adding any latency for legitimate successful logins.
+            user_ok = secrets.compare_digest(user, _ADMIN_USER)
+            pass_ok = secrets.compare_digest(pwd,  _ADMIN_PASS)
+            if user_ok and pass_ok:
                 st.session_state.adm_auth = True
                 st.rerun()
             else:
+                import time
+                time.sleep(0.5)   # brute-force throttle
                 st.error("❌ Invalid credentials — access denied.", icon=None)
 
 
@@ -299,7 +339,7 @@ def _load_logs(limit: int = 50) -> pd.DataFrame:
     attack-type classification) happens here — inside the cache.  Subsequent
     widget interactions read the cached result without touching the DB or CPU.
     """
-    raw: list[dict] = asyncio.run(get_recent_logs(limit=limit))
+    raw: list[dict] = _run(get_recent_logs(limit=limit))
     if not raw:
         return pd.DataFrame()
 
@@ -646,6 +686,9 @@ else:
 # ══════════════════════════════════════════════════════════════════════════════
 
 db_path = os.getenv("DB_PATH", str(ROOT / "sentinel_audit.db"))
+# Show only the filename, not the full host path — prevents internal path
+# disclosure to anyone who can screenshot or access the dashboard (HIGH-07).
+db_display = Path(db_path).name
 st.markdown(
     f"""
     <div style="margin-top:2.5rem;padding-top:1rem;
@@ -654,7 +697,7 @@ st.markdown(
                 font-family:'JetBrains Mono',monospace;
                 font-size:.63rem;color:#243d55">
         SentinelAgent Admin Dashboard · cache TTL 30 s ·
-        DB: <span style="color:#1c3346">{db_path}</span>
+        DB: <span style="color:#1c3346">{db_display}</span>
     </div>
     """,
     unsafe_allow_html=True,

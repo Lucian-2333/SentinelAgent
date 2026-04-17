@@ -43,9 +43,12 @@ async def audit_packet(packet: Packet) -> ConsensusVerdict:
         )
     except Exception as exc:
         logger.exception("Pipeline failure for packet %s", packet.packet_id)
+        # HIGH-03: Return a generic message to the caller — the full exception
+        # (which may contain internal paths or API error bodies) is only written
+        # to the server log, never sent over the wire.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Audit pipeline error: {exc}",
+            detail="Audit pipeline error. Check server logs for details.",
         ) from exc
 
     # ── Persist audit record ──────────────────────────────────────────────────

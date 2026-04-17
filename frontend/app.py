@@ -27,6 +27,29 @@ from shared.schemas import Packet, PacketMetadata, SourceType, VerdictStatus  # 
 _pattern_agent = PatternAgent()
 _context_agent = ContextAgent()
 
+
+# ── Async helper ────────────────────────────────────────────────────────────
+# HIGH-01: asyncio.run() raises RuntimeError when an event loop is already
+# running (Streamlit ≥1.18 uses one internally).  Use a dedicated loop that
+# runs in a background thread to stay safe across all Streamlit versions.
+
+def _run(coro):
+    """Run an async coroutine from synchronous Streamlit code, safely."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # We're inside a running loop (Streamlit's internal one).
+        # Submit the work to a fresh thread-local event loop instead.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result()
+    else:
+        return asyncio.run(coro)
+
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(page_title="SentinelAgent", page_icon="🛡️", layout="wide",
                    initial_sidebar_state="collapsed")
@@ -369,7 +392,7 @@ with col2:
             '<div class="blurred idle-hint">规则专家分析中...</div>',
             unsafe_allow_html=True,
         )
-        pattern_result = asyncio.run(_pattern_agent.analyse(packet))
+        pattern_result = _run(_pattern_agent.analyse(packet))
         anim_bubbles.markdown(_bubble_html([pattern_result]), unsafe_allow_html=True)
         time.sleep(0.4)
 
@@ -379,7 +402,7 @@ with col2:
             + '<div class="deepseek-waiting">⏳ 正在连接 DeepSeek API，语义分析中...</div>',
             unsafe_allow_html=True,
         )
-        context_result = asyncio.run(_context_agent.analyse(packet))
+        context_result = _run(_context_agent.analyse(packet))
         anim_bubbles.markdown(
             _bubble_html([pattern_result, context_result]),
             unsafe_allow_html=True,
@@ -394,8 +417,8 @@ with col2:
         # ── Step D：写入审计日志数据库 ───────────────────────────────
         try:
             from shared.database import init_db, log_request
-            asyncio.run(init_db())
-            asyncio.run(log_request({
+            _run(init_db())
+            _run(log_request({
                 "source_ip":    packet.metadata.ip_address or "127.0.0.1",
                 "payload":      packet.raw_text,
                 "risk_score":   verdict.aggregate_confidence,

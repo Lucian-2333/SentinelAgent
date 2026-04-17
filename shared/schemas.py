@@ -114,6 +114,10 @@ class Packet(BaseModel):
     raw_text: str = Field(
         ...,
         min_length=1,
+        # MED-04: Cap payload size to prevent memory exhaustion on the 400 MB
+        # container and runaway LLM token costs. 32 KB covers any realistic
+        # prompt or HTTP body while blocking multi-megabyte flood attacks.
+        max_length=32_768,
         description=(
             "The verbatim, unmodified payload.  Agents MUST reference exact "
             "substrings from this field as evidence — never paraphrase."

@@ -1,0 +1,155 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SentinelAgent — Docker Compose deployment
+#
+# Target: Ubuntu 24.04 · 1 GB RAM · Swap enabled
+#
+# Services
+#   gateway   — FastAPI audit API         → http://HOST:8000
+#   dashboard — Streamlit admin UI        → http://HOST:8501
+#
+# Both services share a single image built from ./Dockerfile.
+# The SQLite database is persisted on the host via the ./data volume mount so
+# container recreations never lose audit history.
+#
+# Memory budget (1 GB host):
+#   gateway   400 M  + dashboard 400 M  = 800 M  (leaves 200 M for the OS)
+#   Swap absorbs transient spikes from Streamlit's Pandas/Plotly operations.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Layer-1 Gateway (FastAPI + Uvicorn) ─────────────────────────────────────
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime          # skip the builder stage for the final image
+
+    image: sentinel-agent:latest   # shared tag so dashboard reuses the same build
+
+    container_name: sentinel_gateway
+
+    restart: always
+
+    # Hard memory ceiling — Linux OOM-killer kills the container before it can
+    # starve the host.  memswap_limit = mem_limit means NO extra swap for this
+    # container (swap headroom is reserved for the host kernel and dashboard).
+    mem_limit: 400m
+    memswap_limit: 400m
+
+    # MED-02: Drop all Linux capabilities and prevent privilege escalation.
+    # The application only needs network access — no special capabilities required.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    env_file:
+      - .env                       # DEEPSEEK_API_KEY, ADMIN_PASSWORD, etc.
+
+    environment:
+      DB_PATH: /app/data/sentinel_audit.db   # always use the mounted volume
+      PYTHONUNBUFFERED: "1"
+      # MED-01: sentinel system user has no real home dir; point HOME to /tmp
+      # so Streamlit / other tools that write ~/.config can still function.
+      HOME: /tmp
+
+    volumes:
+      # Persist the SQLite database across container recreations
+      - ./data:/app/data
+
+    ports:
+      - "8000:8000"
+
+    # Uvicorn: single worker is correct for 1-vCPU / 400 M environments.
+    # LOW-01: Access logs are kept ON — they are the primary forensic record
+    # of which IPs called which endpoints. Use a log-rotation driver if needed.
+    command: >
+      uvicorn gateway.main:app
+        --host 0.0.0.0
+        --port 8000
+        --workers 1
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+
+  # ── Admin Dashboard (Streamlit) ──────────────────────────────────────────────
+  dashboard:
+    image: sentinel-agent:latest   # reuse the image already built for gateway
+
+    container_name: sentinel_dashboard
+
+    restart: always
+
+    mem_limit: 400m
+    memswap_limit: 400m
+
+    # MED-02: Drop all Linux capabilities and prevent privilege escalation.
+    # The application only needs network access — no special capabilities required.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    env_file:
+      - .env
+
+    environment:
+      DB_PATH: /app/data/sentinel_audit.db
+      PYTHONUNBUFFERED: "1"
+      HOME: /tmp
+
+    volumes:
+      # NOTE: The :ro (read-only) flag is intentionally removed.
+      # SQLite WAL mode requires write access to the -shm sidecar file even
+      # for read-only queries.  With :ro the dashboard container cannot create
+      # -shm and raises "unable to open database file" on every page load.
+      # Security is maintained by: no-new-privileges, cap_drop ALL, and the
+      # login gate in the dashboard itself.
+      - ./data:/app/data
+
+    ports:
+      # CRIT-05: Bind the admin dashboard to localhost only — it must NOT be
+      # reachable from the public internet. Access it via SSH port-forwarding:
+      #   ssh -L 8501:localhost:8501 user@your-server
+      - "127.0.0.1:8501:8501"
+
+    # --server.headless suppresses the browser-open prompt in container logs.
+    # --server.fileWatcherType none prevents inotify exhaustion on small VMs.
+    # --browser.serverAddress/serverPort tell Streamlit to build WebSocket URLs
+    #   pointing at localhost so the SSH tunnel (ssh -L 8501:localhost:8501)
+    #   works correctly.
+    # --server.enableCORS false is required for SSH-tunnel access (the tunnel
+    #   rewrites the Origin header and Streamlit's CORS check would reject it).
+    # --server.enableXsrfProtection false: Streamlit's XSRF token is validated
+    #   via a WebSocket handshake Origin check that always fails through an SSH
+    #   tunnel.  The dashboard is bound to 127.0.0.1 only (not public) and is
+    #   login-gated, so the residual CSRF risk is acceptable.
+    command: >
+      streamlit run frontend/app.py
+        --server.port 8501
+        --server.address 0.0.0.0
+        --server.headless true
+        --server.fileWatcherType none
+        --browser.serverAddress localhost
+        --browser.serverPort 8501
+        --server.enableCORS false
+        --server.enableXsrfProtection false
+
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

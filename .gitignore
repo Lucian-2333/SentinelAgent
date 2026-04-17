@@ -26,6 +26,8 @@ Thumbs.db
 *.log
 *.tmp
 sentinel_audit.db
+sentinel_audit.db-wal
+sentinel_audit.db-shm
 
 # Project-specific local backups and generated outputs
 frontend_backup_*/

@@ -118,9 +118,13 @@ async def init_db() -> None:
     """
     logger.info("Initialising audit database at %s", _DB_PATH)
     async with aiosqlite.connect(_DB_PATH) as db:
+        # LOW-03: Enable WAL (Write-Ahead Log) mode so concurrent readers
+        # (dashboard) never block the gateway writer, and vice-versa.
+        # WAL is persistent — this PRAGMA only needs to be set once per file.
+        await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute(_CREATE_TABLE_SQL)
         await db.commit()
-    logger.info("Audit database ready.")
+    logger.info("Audit database ready (WAL mode enabled).")
 
 
 async def log_request(data: dict[str, Any]) -> int:
@@ -186,21 +190,17 @@ async def get_recent_logs(limit: int = 100) -> list[dict[str, Any]]:
     """
     Retrieve the most recent audit log entries (newest first).
 
-    Intended for the Streamlit dashboard and debugging.  Not exposed on
-    the public API by default — add a route in gateway/router.py if needed.
-
-    Parameters
-    ----------
-    limit : int — maximum number of rows to return (default 100, max 1000).
-
-    Returns
-    -------
-    list of dicts with keys: id, timestamp, source_ip, payload,
-                              risk_score, reasoning, final_action
+    Opens the database in read-only URI mode (?mode=ro) so that this
+    function works on a read-only filesystem mount (the dashboard container
+    mounts ./data:ro).  In read-only mode SQLite uses in-process memory for
+    the WAL index instead of requiring a writable -shm sidecar file.
     """
     limit = min(max(1, limit), 1000)  # clamp to [1, 1000]
 
-    async with aiosqlite.connect(_DB_PATH) as db:
+    # file: URI with mode=ro — works on read-only mounts, WAL-safe on Linux
+    ro_uri = f"file:{_DB_PATH}?mode=ro"
+
+    async with aiosqlite.connect(ro_uri, uri=True) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?",

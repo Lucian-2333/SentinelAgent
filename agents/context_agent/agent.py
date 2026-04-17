@@ -3,21 +3,22 @@ agents/context_agent/agent.py
 ─────────────────────────────────────────────────────────────────────────────
 SentinelAgent — Context Agent (Semantic / LLM Expert)
 
-Layer-N Expert #2: intent-level semantic analysis via DeepSeek API.
-Detects attacks that have no lexical signature — jailbreaks, persona
-overrides, indirect prompt injections — by reasoning about the *meaning*
-of the payload.
+Layer-N Expert #2: intent-level semantic analysis via a configurable LLM
+backend.  Detects attacks that have no lexical signature — jailbreaks, persona
+overrides, indirect prompt injections — by reasoning about the *meaning* of
+the payload.
 
-LLM backend: DeepSeek (OpenAI-compatible), configured via .env
-  DEEPSEEK_API_KEY  — secret key
-  DEEPSEEK_BASE_URL — endpoint (default: https://api.deepseek.com)
-  DEEPSEEK_MODEL    — model name (default: deepseek-chat)
+LLM backend is controlled by LLM_PROVIDER in .env:
+  deepseek          → DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL
+  openai            → OPENAI_API_KEY / OPENAI_MODEL
+  anthropic         → ANTHROPIC_API_KEY / ANTHROPIC_MODEL
+  openai_compatible → OPENAI_COMPATIBLE_API_KEY / BASE_URL / MODEL
 
 This agent always calls the real API regardless of SENTINEL_DEMO_MODE,
 because semantic analysis is its entire purpose.  The PatternAgent
 provides the deterministic fallback if this agent fails.
 
-Fallback policy: on any API / parse error → Safe-Pass (UNKNOWN, conf=0.0)
+Fallback policy: on any API / parse error → Safe-Pass (BENIGN, conf=0.0)
 with a warning flag in reasoning so the judge can account for it.
 ─────────────────────────────────────────────────────────────────────────────
 """
@@ -26,9 +27,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import re
 
 from agents.base_agent import BaseAgent
+from shared.llm_client import LLMClient
 from shared.schemas import AuditResult, Packet, ThreatCategory
 
 logger = logging.getLogger("sentinel.agent.context")
@@ -61,31 +63,16 @@ RULES:
 4. Do NOT include any text outside the JSON object.\
 """
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DeepSeek client configuration  (reads from .env / environment)
-# ─────────────────────────────────────────────────────────────────────────────
+# Robust JSON extractor: handles ``` fences, ```json fences, and bare JSON
+_JSON_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
-def _get_deepseek_config() -> tuple[str, str, str]:
-    """
-    Return (api_key, base_url, model) from environment.
-    Raises RuntimeError with a clear message if the key is missing.
-    """
-    # python-dotenv is optional; load if available
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
 
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError(
-            "DEEPSEEK_API_KEY is not set. "
-            "Add it to your .env file: DEEPSEEK_API_KEY=sk-..."
-        )
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    model    = os.getenv("DEEPSEEK_MODEL",    "deepseek-chat")
-    return api_key, base_url, model
+def _extract_json(raw: str) -> str:
+    """Return the JSON string from a raw LLM response, stripping markdown fences."""
+    match = _JSON_RE.search(raw)
+    if match:
+        return match.group(1)
+    return raw.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -94,73 +81,53 @@ def _get_deepseek_config() -> tuple[str, str, str]:
 
 class ContextAgent(BaseAgent):
     """
-    Semantic intent analyser backed by DeepSeek API.
+    Semantic intent analyser backed by a configurable LLM (via LLMClient).
 
-    Always calls the real API (ignores SENTINEL_DEMO_MODE) because
-    semantic reasoning is its sole purpose.  On failure it returns a
-    Safe-Pass verdict so the pipeline degrades gracefully.
+    The active provider is selected by LLM_PROVIDER in .env — no code changes
+    required to switch between DeepSeek, OpenAI, Anthropic, or any compatible
+    endpoint.  On failure it returns a Safe-Pass verdict so the pipeline
+    degrades gracefully using the PatternAgent result alone.
     """
 
     agent_id = "context_agent_v1"
 
+    def __init__(self) -> None:
+        self._llm = LLMClient()
+
     async def _analyse(self, packet: Packet) -> AuditResult:
-        return await self._deepseek_response(packet)
-
-    # ── DeepSeek API call ─────────────────────────────────────────────────
-
-    async def _deepseek_response(self, packet: Packet) -> AuditResult:
-        try:
-            from openai import AsyncOpenAI
-        except ImportError:
-            return self._safe_pass(packet, "openai SDK not installed — run: pip install openai")
-
+        # CRIT-04: XML-style delimiters isolate user-controlled content from
+        # instructions, raising the bar for prompt-injection attacks.
         user_message = (
-            f"Analyze the following INPUT TEXT for security threats.\n\n"
-            f"INPUT TEXT:\n```\n{packet.raw_text}\n```\n\n"
-            f"Return ONLY the JSON object. Evidence must be verbatim substrings of the INPUT TEXT."
+            "Analyze the following INPUT TEXT for security threats.\n\n"
+            "<input_text>\n"
+            f"{packet.raw_text}\n"
+            "</input_text>\n\n"
+            "Return ONLY the JSON object. Evidence must be verbatim substrings "
+            "of the INPUT TEXT enclosed in <input_text> tags above."
+        )
+
+        logger.info(
+            "[%s] Calling LLM (provider=%s) for packet=%s",
+            self.agent_id, self._llm.provider, packet.packet_id,
         )
 
         try:
-            api_key, base_url, model = _get_deepseek_config()
-        except RuntimeError as exc:
-            return self._safe_pass(packet, str(exc))
-
-        logger.info("[%s] Calling DeepSeek model=%s for packet=%s",
-                    self.agent_id, model, packet.packet_id)
-
-        try:
-            client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-            response = await client.chat.completions.create(
-                model=model,
-                max_tokens=int(os.getenv("LLM_MAX_TOKENS", "512")),
-                temperature=float(os.getenv("LLM_TEMPERATURE", "0.1")),
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_message},
-                ],
-            )
-            raw_text = response.choices[0].message.content or ""
-            logger.debug("[%s] DeepSeek raw response: %s", self.agent_id, raw_text[:200])
+            response = await self._llm.chat(SYSTEM_PROMPT, user_message)
+            raw_text = response.text
+            logger.debug("[%s] LLM raw response: %s", self.agent_id, raw_text[:200])
         except Exception as exc:
-            logger.warning("[%s] DeepSeek API error: %s", self.agent_id, exc)
-            return self._safe_pass(packet, f"DeepSeek API error: {exc}")
+            logger.warning("[%s] LLM API error: %s", self.agent_id, exc)
+            return self._safe_pass(packet, f"LLM API error ({self._llm.provider}): {exc}")
 
         # ── Parse JSON ────────────────────────────────────────────────────
         try:
-            # Strip accidental markdown fences if the model adds them anyway
-            clean = raw_text.strip()
-            if clean.startswith("```"):
-                clean = clean.split("```")[1]
-                if clean.startswith("json"):
-                    clean = clean[4:]
-            data = json.loads(clean.strip())
+            data = json.loads(_extract_json(raw_text))
         except json.JSONDecodeError as exc:
             logger.warning("[%s] JSON parse failed: %s | raw=%s",
                            self.agent_id, exc, raw_text[:300])
             return self._safe_pass(packet, f"JSON parse error: {exc}")
 
         # ── Map risk_score alias ──────────────────────────────────────────
-        # Accept both "confidence" and "risk_score" field names for flexibility
         confidence = float(
             data.get("confidence", data.get("risk_score", 0.0))
         )
@@ -207,8 +174,8 @@ class ContextAgent(BaseAgent):
         return AuditResult(
             agent_id=self.agent_id,
             packet_id=packet.packet_id,
-            threat_category=ThreatCategory.BENIGN,   # BENIGN allows evidence=[]
-            confidence=0.0,                           # 0.0 = no weight in consensus
+            threat_category=ThreatCategory.BENIGN,
+            confidence=0.0,
             reasoning=(
                 f"⚠️ [SAFE-PASS] ContextAgent could not complete semantic analysis. "
                 f"Reason: {reason}. "

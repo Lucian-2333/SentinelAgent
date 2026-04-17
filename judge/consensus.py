@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import defaultdict
 
 from agents.context_agent.agent import ContextAgent
@@ -41,8 +42,8 @@ logger = logging.getLogger("sentinel.judge")
 # Tunable thresholds  (move to config/env vars before production)
 # ──────────────────────────────────────────────────────────────────────────────
 
-BLOCK_THRESHOLD = 0.70        # aggregate_confidence ≥ this → BLOCK
-QUARANTINE_THRESHOLD = 0.45   # aggregate_confidence ≥ this → QUARANTINE (else ALLOW)
+BLOCK_THRESHOLD      = float(os.getenv("BLOCK_THRESHOLD",      "0.70"))
+QUARANTINE_THRESHOLD = float(os.getenv("QUARANTINE_THRESHOLD", "0.45"))
 
 # Agent weights: higher weight = more influence on the final verdict
 AGENT_WEIGHTS: dict[str, float] = {
@@ -148,10 +149,31 @@ async def run_consensus_pipeline(packet: Packet) -> ConsensusVerdict:
     """
     logger.info("Starting consensus pipeline for packet %s", packet.packet_id)
 
-    results: list[AuditResult] = await asyncio.gather(
+    # HIGH-02: Use return_exceptions=True so a single agent failure cannot kill
+    # the entire pipeline.  Exceptions are logged and replaced with a safe BENIGN
+    # fallback so the surviving agent's result still determines the verdict.
+    raw_results = await asyncio.gather(
         *[agent.analyse(packet) for agent in _AGENTS],
-        return_exceptions=False,
+        return_exceptions=True,
     )
+
+    results: list[AuditResult] = []
+    for agent, outcome in zip(_AGENTS, raw_results):
+        if isinstance(outcome, BaseException):
+            logger.error(
+                "Agent %s raised an exception for packet %s — using safe-PASS fallback: %s",
+                agent.__class__.__name__, packet.packet_id, outcome,
+            )
+            # Safe fallback: treat the failed agent as BENIGN with zero confidence
+            results.append(AuditResult(
+                agent_id=getattr(agent, "agent_id", agent.__class__.__name__),
+                threat_category=ThreatCategory.BENIGN,
+                confidence=0.0,
+                reasoning=f"Agent error: {type(outcome).__name__} — result unavailable.",
+                evidence=[],
+            ))
+        else:
+            results.append(outcome)
 
     verdict = build_verdict(list(results), packet.packet_id)
 
